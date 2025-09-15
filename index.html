@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+	<title>MMORPG Client - World Map</title>
+	<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+	<canvas id="world-canvas"></canvas>
+	<script>
+	(function() {
+		const canvas = document.getElementById('world-canvas');
+		const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+
+		const worldImage = new Image();
+		worldImage.src = './world.jpg';
+		let worldLoaded = false;
+
+		// WebSocket and game state
+		const SERVER_URL = 'wss://codepath-mmorg.onrender.com';
+		let socket = null;
+		let myPlayerId = null;
+		const playersById = {};
+		const avatarsByName = {};
+		const avatarImageCache = Object.create(null); // name -> dir -> frameIdx -> HTMLImageElement | Offscreen canvas
+
+		// Camera/viewport (top-left world coordinates of the visible window)
+		let viewX = 0;
+		let viewY = 0;
+
+		// Client-side movement prediction
+		let activeDirection = null; // 'up'|'down'|'left'|'right' or null
+		let lastTickTime = 0;
+		const pixelsPerSecond = 180; // local speed for prediction
+
+		function loadImageFromSrc(src) {
+			return new Promise(function(resolve, reject) {
+				const img = new Image();
+				img.onload = function() { resolve(img); };
+				img.onerror = function(e) { reject(e); };
+				img.src = src;
+			});
+		}
+
+		function ensureAvatarCache(avatarDef) {
+			if (!avatarDef || !avatarDef.frames) return Promise.resolve();
+			const name = avatarDef.name;
+			if (!avatarImageCache[name]) avatarImageCache[name] = Object.create(null);
+
+			const directions = ['north', 'south', 'east'];
+			const promises = [];
+			for (let i = 0; i < directions.length; i++) {
+				const dir = directions[i];
+				const frames = avatarDef.frames[dir] || [];
+				if (!avatarImageCache[name][dir]) avatarImageCache[name][dir] = [];
+				for (let f = 0; f < frames.length; f++) {
+					if (!avatarImageCache[name][dir][f]) {
+						promises.push(
+							loadImageFromSrc(frames[f]).then(function(img) {
+								avatarImageCache[name][dir][f] = img;
+							})
+						);
+					}
+				}
+			}
+			return Promise.all(promises).then(function() {
+				// Precompute west by flipping east
+				const eastFrames = avatarImageCache[name]['east'] || [];
+				if (!avatarImageCache[name]['west']) avatarImageCache[name]['west'] = [];
+				for (let f = 0; f < eastFrames.length; f++) {
+					if (!avatarImageCache[name]['west'][f] && eastFrames[f]) {
+						const src = eastFrames[f];
+						const off = document.createElement('canvas');
+						off.width = src.width;
+						off.height = src.height;
+						const octx = off.getContext('2d');
+						octx.save();
+						octx.scale(-1, 1);
+						octx.drawImage(src, -src.width, 0);
+						octx.restore();
+						avatarImageCache[name]['west'][f] = off;
+					}
+				}
+			});
+		}
+
+		function getAvatarFrame(avatarName, facing, frameIndex) {
+			const dir = facing || 'south';
+			const idx = Math.max(0, Math.min(2, frameIndex || 0));
+			const name = avatarName;
+			const cache = avatarImageCache[name];
+			if (!cache) return null;
+			const dirCache = cache[dir];
+			if (!dirCache) return null;
+			return dirCache[idx] || null;
+		}
+
+		function connect() {
+			try { if (socket) socket.close(); } catch (e) {}
+			socket = new WebSocket(SERVER_URL);
+			socket.addEventListener('open', function() {
+				socket.send(JSON.stringify({ action: 'join_game', username: 'Jerry' }));
+				console.debug('[ws] join_game sent');
+			});
+			socket.addEventListener('message', function(ev) {
+				let msg = null;
+				try { msg = JSON.parse(ev.data); } catch (e) { return; }
+				if (!msg || !msg.action) return;
+
+				if (msg.action === 'join_game' && msg.success) {
+					myPlayerId = msg.playerId;
+					// Populate minimal state
+					for (const id in msg.players) { playersById[id] = msg.players[id]; }
+					for (const name in msg.avatars) { avatarsByName[name] = msg.avatars[name]; }
+					const me = playersById[myPlayerId];
+					const myAvatarDef = avatarsByName[me.avatar];
+					ensureAvatarCache(myAvatarDef).then(function() {
+						requestRender();
+					});
+				}
+
+				if (msg.action === 'players_moved' && msg.players) {
+					for (const id in msg.players) {
+						if (playersById[id]) {
+							const p = msg.players[id];
+							// Don't overwrite my position if I'm actively moving locally
+							if (id === myPlayerId && activeDirection) {
+								playersById[id].facing = p.facing;
+								playersById[id].isMoving = p.isMoving;
+								playersById[id].animationFrame = p.animationFrame;
+							} else {
+								playersById[id].x = p.x;
+								playersById[id].y = p.y;
+								playersById[id].facing = p.facing;
+								playersById[id].isMoving = p.isMoving;
+								playersById[id].animationFrame = p.animationFrame;
+							}
+						}
+					}
+					requestRender();
+				}
+			});
+			socket.addEventListener('close', function() {
+				// Minimal retry logic
+				setTimeout(connect, 1000);
+			});
+		}
+
+		function resizeCanvasToViewport() {
+			const dpr = window.devicePixelRatio || 1;
+			const cssWidth = window.innerWidth;
+			const cssHeight = window.innerHeight;
+
+			canvas.style.width = cssWidth + 'px';
+			canvas.style.height = cssHeight + 'px';
+
+			const backingWidth = Math.floor(cssWidth * dpr);
+			const backingHeight = Math.floor(cssHeight * dpr);
+			if (canvas.width !== backingWidth || canvas.height !== backingHeight) {
+				canvas.width = backingWidth;
+				canvas.height = backingHeight;
+			}
+			requestRender();
+		}
+
+		function clear() {
+			ctx.clearRect(0, 0, canvas.width, canvas.height);
+		}
+
+		function clamp(n, min, max) {
+			if (n < min) return min;
+			if (n > max) return max;
+			return n;
+		}
+
+		function updateCamera() {
+			const me = myPlayerId ? playersById[myPlayerId] : null;
+			if (!me || !worldLoaded) return;
+			const dpr = window.devicePixelRatio || 1;
+			const viewWWorld = Math.floor(canvas.width / dpr);
+			const viewHWorld = Math.floor(canvas.height / dpr);
+			const worldW = worldImage.width;
+			const worldH = worldImage.height;
+
+			// Use the current frame size to center on the avatar's visual center
+			const frame = getAvatarFrame(me.avatar, me.facing, me.animationFrame) || getAvatarFrame(me.avatar, 'south', 0);
+			const halfW = frame ? Math.floor(frame.width / 2) : 0;
+			const halfH = frame ? Math.floor(frame.height / 2) : 0;
+
+			let desiredX = Math.floor((me.x + halfW) - viewWWorld / 2);
+			let desiredY = Math.floor((me.y + halfH) - viewHWorld / 2);
+			const maxX = Math.max(0, worldW - viewWWorld);
+			const maxY = Math.max(0, worldH - viewHWorld);
+			viewX = clamp(desiredX, 0, maxX);
+			viewY = clamp(desiredY, 0, maxY);
+		}
+
+		let pendingRender = false;
+		function requestRender() {
+			if (pendingRender) return;
+			pendingRender = true;
+			requestAnimationFrame(function() {
+				pendingRender = false;
+				draw();
+			});
+		}
+
+		// Keyboard handling
+		const keyToDirection = {
+			ArrowUp: 'up',
+			ArrowDown: 'down',
+			ArrowLeft: 'left',
+			ArrowRight: 'right'
+		};
+		const keyToFacing = {
+			up: 'north',
+			down: 'south',
+			left: 'west',
+			right: 'east'
+		};
+		const pressed = new Set();
+		const order = []; // most-recent order of keys
+
+		function sendMove(direction) {
+			if (!socket || socket.readyState !== 1) return;
+			console.debug('[ws] move', direction);
+			socket.send(JSON.stringify({ action: 'move', direction: direction }));
+			activeDirection = direction;
+			// Update local facing immediately
+			if (myPlayerId && playersById[myPlayerId]) {
+				playersById[myPlayerId].facing = keyToFacing[direction] || playersById[myPlayerId].facing;
+				playersById[myPlayerId].isMoving = true;
+				requestRender();
+			}
+		}
+
+		function sendStop() {
+			if (!socket || socket.readyState !== 1) return;
+			console.debug('[ws] stop');
+			socket.send(JSON.stringify({ action: 'stop' }));
+			activeDirection = null;
+			if (myPlayerId && playersById[myPlayerId]) {
+				playersById[myPlayerId].isMoving = false;
+				requestRender();
+			}
+		}
+
+		function resolveDirection() {
+			for (let i = order.length - 1; i >= 0; i--) {
+				const k = order[i];
+				if (pressed.has(k)) return keyToDirection[k] || null;
+			}
+			return null;
+		}
+
+		window.addEventListener('keydown', function(e) {
+			if (!keyToDirection.hasOwnProperty(e.key)) return;
+			if (e.repeat) { e.preventDefault(); return; }
+			e.preventDefault();
+			if (!pressed.has(e.key)) {
+				pressed.add(e.key);
+				order.push(e.key);
+			}
+			const dir = keyToDirection[e.key];
+			if (dir) sendMove(dir);
+		});
+
+		window.addEventListener('keyup', function(e) {
+			if (!keyToDirection.hasOwnProperty(e.key)) return;
+			e.preventDefault();
+			pressed.delete(e.key);
+			// remove from order
+			for (let i = order.length - 1; i >= 0; i--) {
+				if (order[i] === e.key) { order.splice(i, 1); break; }
+			}
+			const next = resolveDirection();
+			if (next) {
+				sendMove(next);
+			} else {
+				sendStop();
+			}
+		});
+
+		window.addEventListener('blur', function() {
+			if (pressed.size > 0) {
+				pressed.clear();
+				order.length = 0;
+				sendStop();
+			}
+		});
+
+		function integrate(dtSeconds) {
+			if (!myPlayerId || !playersById[myPlayerId]) return;
+			if (!activeDirection) return;
+			const me = playersById[myPlayerId];
+			let vx = 0, vy = 0;
+			if (activeDirection === 'up') vy = -1;
+			else if (activeDirection === 'down') vy = 1;
+			else if (activeDirection === 'left') vx = -1;
+			else if (activeDirection === 'right') vx = 1;
+			const dx = vx * pixelsPerSecond * dtSeconds;
+			const dy = vy * pixelsPerSecond * dtSeconds;
+			// Clamp to world bounds using current frame size
+			const frame = getAvatarFrame(me.avatar, me.facing, me.animationFrame) || { width: 0, height: 0 };
+			const maxX = Math.max(0, (worldImage.width - frame.width));
+			const maxY = Math.max(0, (worldImage.height - frame.height));
+			me.x = clamp(me.x + dx, 0, maxX);
+			me.y = clamp(me.y + dy, 0, maxY);
+		}
+
+		function tick(ts) {
+			if (!lastTickTime) lastTickTime = ts;
+			const dt = (ts - lastTickTime) / 1000;
+			lastTickTime = ts;
+			integrate(dt);
+			requestRender();
+			requestAnimationFrame(tick);
+		}
+
+		function draw() {
+			clear();
+			if (!worldLoaded) return;
+
+			updateCamera();
+
+			const dpr = window.devicePixelRatio || 1;
+			const worldW = worldImage.width;
+			const worldH = worldImage.height;
+			const viewWWorld = Math.floor(canvas.width / dpr);
+			const viewHWorld = Math.floor(canvas.height / dpr);
+
+			// Draw visible world sub-rectangle: map world pixels -> CSS pixels, then to backing store via dpr
+			ctx.imageSmoothingEnabled = false;
+			ctx.setTransform(1, 0, 0, 1, 0, 0);
+			ctx.drawImage(
+				worldImage,
+				viewX, viewY, viewWWorld, viewHWorld,
+				0, 0, Math.floor(viewWWorld * dpr), Math.floor(viewHWorld * dpr)
+			);
+
+			// Draw all players
+			for (const playerId in playersById) {
+				const player = playersById[playerId];
+				const frame = getAvatarFrame(player.avatar, player.facing, player.animationFrame);
+				if (!frame) continue;
+
+				const drawW = Math.floor(frame.width * dpr);
+				const drawH = Math.floor(frame.height * dpr);
+				
+				let dx, dy;
+				if (playerId === myPlayerId) {
+					// My avatar centered on screen
+					dx = Math.floor(canvas.width / 2 - drawW / 2);
+					dy = Math.floor(canvas.height / 2 - drawH / 2);
+				} else {
+					// Other players positioned relative to camera
+					const screenX = Math.floor((player.x - viewX) * dpr);
+					const screenY = Math.floor((player.y - viewY) * dpr);
+					dx = screenX;
+					dy = screenY;
+				}
+
+				ctx.drawImage(frame, 0, 0, frame.width, frame.height, dx, dy, drawW, drawH);
+
+				// Username label above avatar
+				const label = player.username || 'Player';
+				ctx.font = (16 * dpr) + 'px sans-serif';
+				ctx.textAlign = 'center';
+				ctx.textBaseline = 'bottom';
+				const textX = dx + Math.floor(drawW / 2);
+				const textY = dy - Math.floor(6 * dpr);
+				ctx.lineWidth = Math.max(2, Math.floor(3 * dpr));
+				ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+				ctx.fillStyle = '#fff';
+				ctx.strokeText(label, textX, textY);
+				ctx.fillText(label, textX, textY);
+			}
+		}
+
+		worldImage.addEventListener('load', function() {
+			worldLoaded = true;
+			requestRender();
+		});
+
+		window.addEventListener('resize', resizeCanvasToViewport, { passive: true });
+		resizeCanvasToViewport();
+		connect();
+		requestAnimationFrame(tick);
+	})();
+	</script>
+</body>
+</html>
